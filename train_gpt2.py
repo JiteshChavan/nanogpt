@@ -245,9 +245,11 @@ class GPT (nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load the tokens from disk and store them in memeory
         with open ('input.txt', 'r') as f:
@@ -259,7 +261,7 @@ class DataLoaderLite:
         print (f"1 epoch = {len(self.tokens) // (self.B * self.T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = B * T * self.process_rank
     
     def next_batch (self):
         B = self.B
@@ -269,14 +271,20 @@ class DataLoaderLite:
         x = buf[:-1].view(B,T) # inputs
         y = buf[1:].view(B,T) # targets
         # advance the position in the tensor
-        self.current_position += B*T
+        self.current_position += B*T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = B * T * self.process_rank
         return x, y
 # -----------------------------------------------------------------------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 
 # setup DDP (distributed data parallel).
@@ -317,31 +325,28 @@ total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens.
 B = 4 # micro batch size
 T = 1024 # sequence length
 
-assert total_batch_size % (B*T) == 0, "make sure total batch size is divisible by (B*T)"
-grad_accum_steps = total_batch_size // (B*T)
-print (f"total desired batch size: {total_batch_size}")
-print (f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+assert total_batch_size % (B*T * ddp_world_size) == 0, "make sure total batch size is divisible by (B*T * ddp_world_size)"
+grad_accum_steps = total_batch_size // (B*T * ddp_world_size) # each process will do B*T and theres ddp_world_size processes
+if master_process: # then guard this
+    print (f"total desired batch size: {total_batch_size}")
+    print (f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
+train_loader = DataLoaderLite (B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
-train_loader = DataLoaderLite (B=B, T=T)
-
-# make it so that matrix multiplications use TF32 (instead of FP32) data type (10 mantissa bits stored explicityly)
-# wherever possible to get 8x more FLOPS on paper (not in practice because of bandwidth and migration costs)
-#  or treat each float32 number as the sum of two bfloat16 numbers (approximately 16 mantissa bits with 14 bits explicitly stored),
-#  if the appropriate fast matrix multiplication algorithms are available. Otherwise float32 matrix multiplications are computed as if the precision is “highest”. 
-# even though in principle TF32 offers a lot faster throughput, all these numbers are still float32s and its FP32s that are being shipped
-# all over the place through the memory system, and it's just costing us way too much time to shovel around all this data
-# albeit we have made the multiply itself faster, we are memory bound and we are not actually seeing the full benifit that would come
-# from this napkin math here.
-# Free, slightly more approximate (not gonna notice it basically), faster
 torch.set_float32_matmul_precision ('high')
 
 # let's now decrease amount of stuff we are gonna be moving around by dropping down to bfloat16 (only maintain 16 bits per float)
 
-# get logits
+# Creat model
+# 8 exact same GPT models are created on 8 processes, because the seeds are fixed
 model = GPT (GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    # forward is unchanged, backward is mostly unchanged except there is overlap between computation and communication of gradients
+    # while the backward pass is still going on, to average the gradients from all processes
+    # we're tacking on this average as we will see in a bit
+    model = DDP (model) 
 
 # PyTorch has it's own cosine decay learning rate scheduler
 # but it's just 5 lines of code, I know what's exactly going on
@@ -379,11 +384,23 @@ for step in range (max_steps):
         x, y = x.to(device), y.to(device)
         with torch.autocast (device_type=device, dtype=torch.bfloat16):
             logits, loss = model (x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss so it comes out right.
         loss = loss / grad_accum_steps
         # return a new tensor detached from the computational graph, but it still shares the same underlying storage.
         # stops gradient tracking, lets use the tensor in computations without it contributing to gradients.
         loss_accum += loss.detach()
+
+        # only sync gradients across the processes, at the end of the large batch 0.5M tokens
+        # hacky way to disable gradient sync for every single micro step
+        if ddp:
+            # very last backward will have the grad_sync flag as true
+            model.require_backward_grad_sync = (micro_step == (grad_accum_steps - 1))
         loss.backward () # remember that loss.backward() always deposits gradients (grad += new_grad)
+    # when we come out of the micro steps inner loop
+    # every rank will suddenly, magically have the average of all the gradients on all the ranks
 
     # global norm of parameter vector is the length of it basically.
     # clip global norm of the parameter vector, basically make sure that the "length" of the parameters vector and clip it to 1.0
