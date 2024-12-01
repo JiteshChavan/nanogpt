@@ -285,6 +285,7 @@ class DataLoaderLite:
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import os
 
 # setup DDP (distributed data parallel).
@@ -312,6 +313,7 @@ else:
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
     print (f"using device: {device}")
+    
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -324,6 +326,11 @@ total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens.
 # Because the real batch size is 2**19 either way HAHAHA!
 B = 4 # micro batch size
 T = 1024 # sequence length
+
+# INTROSPECTION! that multi GPU results match single GPU:
+# tweak total batch size so that you have the same number of grad accum steps in both settings
+# to remove the boundary effect which gets us different batches
+# so that we get the same batches and the same loss and gradients
 
 assert total_batch_size % (B*T * ddp_world_size) == 0, "make sure total batch size is divisible by (B*T * ddp_world_size)"
 grad_accum_steps = total_batch_size // (B*T * ddp_world_size) # each process will do B*T and theres ddp_world_size processes
@@ -346,7 +353,8 @@ if ddp:
     # forward is unchanged, backward is mostly unchanged except there is overlap between computation and communication of gradients
     # while the backward pass is still going on, to average the gradients from all processes
     # we're tacking on this average as we will see in a bit
-    model = DDP (model) 
+    model = DDP (model, device_ids=[ddp_local_rank]) 
+raw_model = model.module if ddp else model      # always contains the "raw" unwrapped model
 
 # PyTorch has it's own cosine decay learning rate scheduler
 # but it's just 5 lines of code, I know what's exactly going on
@@ -373,7 +381,8 @@ def get_lr (it):
 # optimize!
 # first try to crush a batch and overfit
 # optimizer = torch.optim.AdamW (model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers (weight_decay = 0.1, learning_rate = 6e-4, device = device)
+optimizer = raw_model.configure_optimizers (weight_decay = 0.1, learning_rate = 6e-4, device = device)
+
 for step in range (max_steps):
     t0 = time.time()
     loss_accum = 0.0
@@ -402,6 +411,11 @@ for step in range (max_steps):
     # when we come out of the micro steps inner loop
     # every rank will suddenly, magically have the average of all the gradients on all the ranks
 
+    if ddp:
+        # calculates average of loss_accum on all the ranks, and it deposits that average on all the ranks
+        # all the ranks will contain loss_accum averaged up
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
     # global norm of parameter vector is the length of it basically.
     # clip global norm of the parameter vector, basically make sure that the "length" of the parameters vector and clip it to 1.0
     # You can get unlucky during optimization, maybe it's a bad data batch, unlucky batches yield very high loss, which could lead to very high gradients,
@@ -418,8 +432,12 @@ for step in range (max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time difference in mili seconds
-    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1-t0)
-    print (f"step {step} | loss : {loss_accum.item():.6f} | lr {lr:.4e} | norm : {norm:.4f} | dt : {dt:.2f}ms, tok/sec : {tokens_per_sec}")
+    tokens_per_sec = (train_loader.B * train_loader.T * ddp_world_size * grad_accum_steps) / (t1-t0)
+    if master_process:
+        print (f"step {step} | loss : {loss_accum.item():.6f} | lr {lr:.4e} | norm : {norm:.4f} | dt : {dt:.2f}ms, tok/sec : {tokens_per_sec}")
+
+if ddp:
+    destroy_process_group ()
 
 import sys; sys.exit(0)
 
