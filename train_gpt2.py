@@ -329,7 +329,7 @@ T = 1024 # sequence length
 
 # INTROSPECTION! that multi GPU results match single GPU:
 # tweak total batch size so that you have the same number of grad accum steps in both settings
-# to remove the boundary effect which gets us different batches
+# to remove the boundary effect of the data loader which gets us slightly different numbers
 # so that we get the same batches and the same loss and gradients
 
 assert total_batch_size % (B*T * ddp_world_size) == 0, "make sure total batch size is divisible by (B*T * ddp_world_size)"
