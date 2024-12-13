@@ -35,7 +35,7 @@ class CausalSelfAttention (nn.Module):
         v = v.view (B, T, self.n_head, C // self.n_head).transpose (1,2) # (B, nh, T, hs)
 
         # attention materializes the large (T,T) matrix for all the queries and keys dotproduct
-        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt (k.size(-1))) # (B, nh, T, hs)
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt (k.size(-1))) # (B, nh, T, T)
         #att = att.masked_fill (self.bias[:,:,:T,:T] == 0, float('-inf'))
         #att = F.softmax (att, dim=-1)
         #y = att @ v # (B, nh, T, T) @ (B, nH, T, Hs) -> (B, nH, T, Hs)
@@ -243,25 +243,39 @@ class GPT (nn.Module):
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens (filename):
+    npt = np.load (filename)
+    npt = npt.astype(np.int32) # Introspective change
+    ptt = torch.tensor (npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        # at init load the tokens from disk and store them in memeory
-        with open ('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding ('gpt2')
-        tokens = enc.encode (text)
-        self.tokens = torch.tensor (tokens)
-        print (f"loaded {len(self.tokens)} tokens")
-        print (f"1 epoch = {len(self.tokens) // (self.B * self.T)} batches")
-
-        # state
-        self.current_position = B * T * self.process_rank
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir (data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted (shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len (shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print (f"found {len(shards)} shards for split {split}")
+        # state init at shard zero
+        self.reset ()
+    
+    def reset (self):
+        self.current_shard = 0
+        self.tokens = load_tokens (self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch (self):
         B = self.B
@@ -274,6 +288,8 @@ class DataLoaderLite:
         self.current_position += B*T * self.num_processes
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens (self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
         return x, y
 # -----------------------------------------------------------------------------------------------------------------------------------------
@@ -338,7 +354,8 @@ if master_process: # then guard this
     print (f"total desired batch size: {total_batch_size}")
     print (f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite (B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataLoaderLite (B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite (B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision ('high')
 
@@ -361,8 +378,8 @@ raw_model = model.module if ddp else model      # always contains the "raw" unwr
 # and I don't like to use abstractions where they are kind of unscrutable and idk what they are doing
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715 # to match GPT-3 warmup schedule
+max_steps = 19073
 def get_lr (it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -385,6 +402,24 @@ optimizer = raw_model.configure_optimizers (weight_decay = 0.1, learning_rate = 
 
 for step in range (max_steps):
     t0 = time.time()
+
+    # once in a while evaluate our validation loss
+    if step % 100 == 0:
+        model.eval ()
+        val_loader.reset ()
+        with torch.no_grad ():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range (val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast (device_type=device, dtype=torch.bfloat16):     # Only possible to do in Ampere. torch.fp16 requires use of gradient scalers as it can not represent the entire range of fp32
+                    logits, loss = model (x,y)
+                
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach ()
+
+
     loss_accum = 0.0
     optimizer.zero_grad ()
     for micro_step in range (grad_accum_steps):
@@ -406,6 +441,7 @@ for step in range (max_steps):
         # hacky way to disable gradient sync for every single micro step
         if ddp:
             # very last backward will have the grad_sync flag as true
+            # for now this hack works, but not a good practice if pytorch takes the flag away.
             model.require_backward_grad_sync = (micro_step == (grad_accum_steps - 1))
         loss.backward () # remember that loss.backward() always deposits gradients (grad += new_grad)
     # when we come out of the micro steps inner loop
