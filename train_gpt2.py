@@ -245,6 +245,7 @@ class GPT (nn.Module):
 import tiktoken
 import numpy as np
 
+
 def load_tokens (filename):
     npt = np.load (filename)
     npt = npt.astype(np.int32) # Introspective change
@@ -296,7 +297,7 @@ class DataLoaderLite:
 # simple launch:
 # python train_gpt2.py
 # DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+    # torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -321,6 +322,7 @@ else:
     # vanilla, non-DDP run
     ddp_rank = 0
     ddp_local_rank = 0
+    ddp_world_size = 1
     master_process = True
     # attempt to autodetect device
     device = "cpu"
@@ -334,6 +336,8 @@ else:
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding('gpt2')
 
 # Simulate total batch size in GPT3 paper by gradient accumulation till batch of specified size is processed and then stepping.
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens.
@@ -364,7 +368,9 @@ torch.set_float32_matmul_precision ('high')
 # Creat model
 # 8 exact same GPT models are created on 8 processes, because the seeds are fixed
 model = GPT (GPTConfig(vocab_size=50304))
-model.to(device)
+use_compile = False # Torch Compile intereferes with HellaSwag eval and  Generataion. TODO: fix
+if use_compile:
+    model.to(device)
 model = torch.compile(model)
 if ddp:
     # forward is unchanged, backward is mostly unchanged except there is overlap between computation and communication of gradients
@@ -403,6 +409,7 @@ optimizer = raw_model.configure_optimizers (weight_decay = 0.1, learning_rate = 
 for step in range (max_steps):
     t0 = time.time()
 
+    
     # once in a while evaluate our validation loss
     if step % 100 == 0:
         model.eval ()
@@ -411,17 +418,66 @@ for step in range (max_steps):
             val_loss_accum = 0.0
             val_loss_steps = 20
             for _ in range (val_loss_steps):
-                x, y = val_loader.next_batch()
+                x, y = val_loader.next_batch ()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast (device_type=device, dtype=torch.bfloat16):     # Only possible to do in Ampere. torch.fp16 requires use of gradient scalers as it can not represent the entire range of fp32
-                    logits, loss = model (x,y)
-                
+                with torch.autocast (device_type=device, dtype=torch.bfloat16): # Only possible to do in Ampere. torch.fp16 requires use of gradient scalers as it can not represent the entire range of fp32
+                    logits, loss = model (x, y)
                 loss = loss / val_loss_steps
-                val_loss_accum += loss.detach ()
+                val_loss_accum += loss.detach()
 
+        if ddp:
+            dist.all_reduce (val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            # we have roughly infinity data, so we are expecting train and val loss to be the same.
+            print (f"Validation loss : {val_loss_accum.item():.4f}")
+    
+    # once in a while generate from the model (except step 0, which is noise)
+    # disabled because torch.compile throws a scary error i can't solve rn
+    # if you disable torch.compile this code works fine
+    if step > 0 and step % 100 == 0 and use_compile:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 50
 
-    loss_accum = 0.0
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor (tokens, dtype=torch.long)
+        
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        # Separate generator object for sampling, because I don't want to impact the rng state of the random number generator that is the global one
+        # used for training. I want this to be completely outside the training loop.
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed (42 + ddp_rank)
+
+        while xgen.size(1) < max_length:
+            
+            # forward the model and get the logits
+            with torch.no_grad ():
+                logits, loss = model (xgen) # (B, T, Vocab_size)
+                # take the logits at the last position
+                logits = logits [:,-1,:] # (B, Vocab_size)
+                # get the probabilities
+                probs = F.softmax (logits, dim=-1) # (B, Vocab_size)
+                # do top-k sampling of 50
+                # top-k probs here becomes (4, 50) top-k indices is becomes (4,50)
+                topk_probs, topk_indices = torch.topk (probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: Multinomial does not demand the input to sum to 1
+                ix = torch.multinomial (topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather (topk_indices, -1, ix)
+                # append to the sequence
+                xgen= torch.cat ((xgen,xcol), dim=1)
+        # print the generated text
+        for i in range (num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print (f"rank {ddp_rank} sample {i} : {decoded}")
+
+    # training loop
+    model.train()
     optimizer.zero_grad ()
+    loss_accum = 0.0
     for micro_step in range (grad_accum_steps):
         x, y = train_loader.next_batch()
         # ship active batches to gpu during training to be memory efficient    
@@ -492,8 +548,7 @@ model.to (device)
 print ("didn't crash yay!")
 
 # prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
+
 tokens = enc.encode ("Hello, I'm a language model,") # (8,)
 tokens = torch.tensor (tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat (num_return_sequences, 1) # (5, 8)
