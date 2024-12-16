@@ -392,11 +392,10 @@ torch.set_float32_matmul_precision ('high')
 # Creat model
 # 8 exact same GPT models are created on 8 processes, because the seeds are fixed
 model = GPT (GPTConfig(vocab_size=50304))
-
+model.to(device)
 use_compile = False # Torch Compile intereferes with HellaSwag eval and  Generataion. TODO: fix
 if use_compile:
-    model.to(device)
-model = torch.compile(model)
+    model = torch.compile(model)
 if ddp:
     # forward is unchanged, backward is mostly unchanged except there is overlap between computation and communication of gradients
     # while the backward pass is still going on, to average the gradients from all processes
@@ -465,8 +464,21 @@ for step in range (max_steps):
             print (f"Validation loss : {val_loss_accum.item():.4f}")
             with open (log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 4 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
     
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate (iterate_examples ("val")):
@@ -500,7 +512,7 @@ for step in range (max_steps):
                 f.write (f"{step} hella {acc_norm:.4f}\n")
     
     # once in a while generate from the model (except step 0, which is noise)
-    if step > 0 and step % 100 == 0 and use_compile:
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
         max_length = 50
@@ -600,62 +612,3 @@ for step in range (max_steps):
 if ddp:
     destroy_process_group ()
 
-import sys; sys.exit(0)
-
-
-
-# Uncomment to load weights from pre-trained hugging face model
-# model = GPT.from_pretrained ('gpt2')
-
-# random initialized GPT model from default constructor we wrote.
-# all the constructors for nn modules in pytorch initialize using Xavier/ Kaiming init
-model = GPT (GPTConfig())
-
-model.eval()    # good practice to put model into eval mode when you're not training it and just using it. For this model right now it shouldn't do anything as we do not have any layers or modules that have different behaviour at training or evaluation time for example dropout of batchnorm
-# for now model.eval potentially does nothing, but I'm actually not sure if this is the case and maybe pytorch internals do some clever thing depending on eval mode
-model.to (device)
-print ("didn't crash yay!")
-
-# prefix tokens
-
-tokens = enc.encode ("Hello, I'm a language model,") # (8,)
-tokens = torch.tensor (tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat (num_return_sequences, 1) # (5, 8)
-x = tokens.to(device)
-
-
-# generate!  right now x is (B, T) where B is 5 and T is 8
-# set the seed to 42
-torch.manual_seed (42)
-torch.cuda.manual_seed (42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-
-        # we initialize tensors on correct device as indicated by the input x to the model, in forward pass, so that there's no mismatch.
-        logits = model (x) # (B, T, vocab_size)
-        # take the logits at the last position (wasteful implementation of sampling)
-        logits = logits [:, -1, :] # (B, vocab_size)
-        # get the probabilities 
-        probs = F.softmax (logits, dim=-1) # (B, vocab_size)
-        # do the top-k sampling of 50 (hugging face pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices (5, 50)
-        # take top 50 probabilities from vocab anything lower than the 50th highest probability is clamped to 0 and then re normalize.
-        # that way we are never sampling very rare tokens, the tokens that we are sampling are always in the top 50 of most likely tokens.
-        # helps keep the model on track, and it doesn't blabbler on, it doesnt get lost, it go off the rails as easily
-        # it sticks in the vicinity of likely tokens a lot better
-        topk_probs, topk_indices = torch.topk (probs, 50, dim=-1)
-        # select a token from top-k probabilities
-        ix = torch.multinomial (topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather (topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat ((x, xcol), dim=1) # (B, T+1)
-
-
-# now we have x of size (5, 50)
-# print the generated text
-for i in range (num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode (tokens)
-    print (">", decoded)
