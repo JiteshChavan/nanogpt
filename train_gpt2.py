@@ -126,6 +126,9 @@ class GPT (nn.Module):
 
         # init params
         self.apply(self._init_weights)
+        #print ("constructor ended.")
+        #import code
+        #code.interact(local=locals())
     
     # hard coding bad practice, wont scale with increasing fanin like Xavier or Kaming init
     # but we will keep this because that is the GPT2 initialization per their source code
@@ -321,7 +324,7 @@ def get_most_likely_row(tokens, mask, logits):
 # simple launch:
 # python train_gpt2.py
 # DDP launch for e.g. 8 GPUs:
-    # torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -368,7 +371,7 @@ total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens.
 # The setting of B is purely optimization performance kind of setting, so in any case you should be getting the same answers
 # upto like a floating point error, because the gradient accumulation kicks in and can handle everything serially! (as necessary)
 # Because the real batch size is 2**19 either way HAHAHA!
-B = 4 # micro batch size
+B = 64 # micro batch size
 T = 1024 # sequence length
 
 # INTROSPECTION! that multi GPU results match single GPU:
@@ -391,11 +394,11 @@ torch.set_float32_matmul_precision ('high')
 
 # Creat model
 # 8 exact same GPT models are created on 8 processes, because the seeds are fixed
+# TODO: Refactor this jank.
+
 model = GPT (GPTConfig(vocab_size=50304))
 model.to(device)
-use_compile = False # Torch Compile intereferes with HellaSwag eval and  Generataion. TODO: fix
-if use_compile:
-    model = torch.compile(model)
+
 if ddp:
     # forward is unchanged, backward is mostly unchanged except there is overlap between computation and communication of gradients
     # while the backward pass is still going on, to average the gradients from all processes
@@ -406,10 +409,12 @@ raw_model = model.module if ddp else model      # always contains the "raw" unwr
 # PyTorch has it's own cosine decay learning rate scheduler
 # but it's just 5 lines of code, I know what's exactly going on
 # and I don't like to use abstractions where they are kind of unscrutable and idk what they are doing
+
+num_epochs = 5
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 # to match GPT-3 warmup schedule
-max_steps = 19073
+max_steps = (19073 * num_epochs)
 def get_lr (it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -424,21 +429,72 @@ def get_lr (it):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-
 # optimize!
 # first try to crush a batch and overfit
 # optimizer = torch.optim.AdamW (model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers (weight_decay = 0.1, learning_rate = 6e-4, device = device)
 
 
+
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
-os.makedirs (log_dir, exist_ok=True)
-log_file = os.path.join (log_dir, f"log.txt")
-with open (log_file, "w") as f: # open for writing to clear the file
-    pass
+if master_process:
+    os.makedirs (log_dir, exist_ok=True)
+    log_file = os.path.join (log_dir, f"log.txt")
+    with open (log_file, "w") as f: # open for writing to clear the file
+        pass
 
-for step in range (max_steps):
+# useless for step 0
+# TODO: change here to specify loading checkpoint
+checkpoint_file_name = "model_0000-1.pt"
+print ("Warning! Loading from", checkpoint_file_name)
+checkpoint_file = os.path.join(log_dir, checkpoint_file_name)
+# Initialize start_step
+if os.path.exists(checkpoint_file):
+    # Load the checkpoint file
+    checkpoint = torch.load(checkpoint_file)
+    start_step = checkpoint['step']  # Resume from the next step
+    # TODO: Load model weights as well
+    optimizer.load_state_dict (checkpoint['optim'])
+    raw_model.load_state_dict (checkpoint['model'])
+    train_loader.current_shard = checkpoint['shard_state']
+    train_loader.tokens = load_tokens (train_loader.shards[train_loader.current_shard])
+    train_loader.current_position = checkpoint['current_pos_GPU0'] + (train_loader.B * train_loader.T * ddp_rank)
+    
+    val_loader.current_shard = checkpoint['val_loader_shard_state']
+    val_loader.tokens = load_tokens (val_loader.shards[val_loader.current_shard])
+    val_loader.current_position = checkpoint['val_loader_current_pos_GPU0'] + (val_loader.B * val_loader.T * ddp_rank)
+
+    print (f"\n\n\nLOADED TRAIN SHARD {train_loader.current_shard}\n\n\n")
+    print (f"\n\n\nLOADED TRAIN TOKENS FROM {train_loader.shards[train_loader.current_shard]}")
+    print (f"\n LOADED CURRENT TRAIN POSITION {train_loader.current_position}")
+
+    #print (f"\n\n\nLOADED VAL SHARD {val_loader.current_shard}\n\n\n")
+    #print (f"\n\n\nLOADED VAL TOKENS FROM {val_loader.shards[val_loader.current_shard]}")
+    #print (f"\n LOADED CURRENT VAL POSITION {val_loader.current_position}")
+    if ddp:
+        model = DDP (raw_model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
+    if master_process:
+        #print (f"!!!!!!!!!!!!!!!$$$$$$$$############LOADING__VOCAB ISZE={raw_model.config.vocab_size}")
+        print(f"Checkpoint loaded, resuming from step {start_step}")
+else:
+    # If no checkpoint exists, start from step 0
+    start_step = 0
+    checkpoint = {}
+    if master_process:
+        print("No checkpoint found, starting from step 0")
+
+
+use_compile = False # Torch Compile intereferes with HellaSwag eval and  Generataion. TODO: fix
+if use_compile:
+    model = torch.compile(model)
+
+
+
+
+
+for step in range (start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
     
@@ -464,17 +520,27 @@ for step in range (max_steps):
             print (f"Validation loss : {val_loss_accum.item():.4f}")
             with open (log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 4 == 0 or last_step):
+            
+            if step > 0 and (step % 10000 == 0 or last_step):
                 # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint_path = os.path.join(log_dir, f"model_{step :05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
+                    'optim' : optimizer.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'shard_state' : train_loader.current_shard,
+                    'current_pos_GPU0' : train_loader.current_position,
+                    'val_loader_shard_state' : val_loader.current_shard,
+                    'val_loader_current_pos_GPU0' : val_loader.current_position
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
+                print (f">__SAVING__TRAIN_SHARD_NUMBER={train_loader.current_shard}")
+                print (f">__SAVING__CURRENT TRAIN POISTION FOR GPU 0={train_loader.current_position}")
+                #print (f"!!!!!!!!!!!!!!!$$$$$$$$############__SAVING__VAL_SHARD_NUMBER={val_loader.current_shard}")
+                #print (f"!!!!!!!!!!!!!!!$$$$$$$$############__SAVING__CURRENT VAL POISTION FOR GPU 0={val_loader.current_position}")
                 torch.save(checkpoint, checkpoint_path)
     
     # once in a while evaluate hellaswag
@@ -515,7 +581,7 @@ for step in range (max_steps):
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
-        max_length = 50
+        max_length = 120
 
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor (tokens, dtype=torch.long)
