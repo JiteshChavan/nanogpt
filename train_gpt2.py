@@ -130,7 +130,7 @@ class GPT (nn.Module):
         #import code
         #code.interact(local=locals())
     
-    # hard coding bad practice, wont scale with increasing fanin like Xavier or Kaming init
+    # hard coding bad practice, wont scale with increasing fan_in like Xavier or Kaming init
     # but we will keep this because that is the GPT2 initialization per their source code
     # 0.02 is reasonably similar to 1/root(768 or 1024 or 1600 or 1280) for the gpt2 models
     def _init_weights (self, module):
@@ -392,7 +392,7 @@ torch.set_float32_matmul_precision ('high')
 
 # let's now decrease amount of stuff we are gonna be moving around by dropping down to bfloat16 (only maintain 16 bits per float)
 
-# Creat model
+# Create model
 # 8 exact same GPT models are created on 8 processes, because the seeds are fixed
 # TODO: Refactor this jank.
 
@@ -446,6 +446,12 @@ if master_process:
 
 # useless for step 0
 # TODO: change here to specify loading checkpoint
+
+# TODO: CHANGE THIS JANK FOR NOT LOADING FROM ANY CHECKPOINT wth is 000-1
+# change along the lines of
+# run_type = 'fresh' vs 'Resume'
+#if run_type is fresh
+
 checkpoint_file_name = "model_0000-1.pt"
 print ("Warning! Loading from", checkpoint_file_name)
 checkpoint_file = os.path.join(log_dir, checkpoint_file_name)
@@ -476,7 +482,6 @@ if os.path.exists(checkpoint_file):
         model = DDP (raw_model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
     if master_process:
-        #print (f"!!!!!!!!!!!!!!!$$$$$$$$############LOADING__VOCAB ISZE={raw_model.config.vocab_size}")
         print(f"Checkpoint loaded, resuming from step {start_step}")
 else:
     # If no checkpoint exists, start from step 0
@@ -525,7 +530,7 @@ for step in range (start_step, max_steps):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step :05d}.pt")
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': raw_model.state_dict(), # same as model.state_dict() both have references to the same weight (courtesy of GPT)
                     'optim' : optimizer.state_dict(),
                     'config': raw_model.config,
                     'step': step,
@@ -597,7 +602,8 @@ for step in range (start_step, max_steps):
             
             # forward the model and get the logits
             with torch.no_grad ():
-                logits, loss = model (xgen) # (B, T, Vocab_size)
+                with torch.autocast (device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model (xgen) # (B, T, Vocab_size)
                 # take the logits at the last position
                 logits = logits [:,-1,:] # (B, Vocab_size)
                 # get the probabilities

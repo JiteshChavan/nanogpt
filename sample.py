@@ -25,11 +25,11 @@ model.to(device)
 model.load_state_dict (checkpoint['model'])
 
 model.eval()
-num_return_sequences = 2
-max_length = 120
+num_return_sequences = 10
+max_length = 50
 
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("It is quite important to be mindful of your thoughts and actions, awareness and self of sense, sadly, are on the decline these days in our society..")
+tokens = enc.encode("Hello I'm a language model,")
 tokens = torch.tensor (tokens, dtype=torch.long)
 
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
@@ -37,7 +37,7 @@ xgen = tokens.to(device)
 # Separate generator object for sampling, because I don't want to impact the rng state of the random number generator that is the global one
 # used for training. I want this to be completely outside the training loop.
 sample_rng = torch.Generator(device=device)
-sample_rng.manual_seed (42)
+sample_rng.manual_seed (1337)
 while xgen.size(1) < max_length:
     
     # forward the model and get the logits
